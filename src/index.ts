@@ -5,6 +5,137 @@ import { z } from "zod";
 
 const API_HOST = `${process.env.TOOLJET_HOST}`;
 
+// Cache of appId -> signed JWT, so we only do the PAT -> session exchange once per app.
+const sessionJwtCache = new Map<string, string>();
+
+// Exchange the static TOOLJET_ACCESS_TOKEN for a short-lived PAT, then exchange that PAT
+// for a signed JWT scoped to the given app. The AI conversation endpoints are guarded by
+// JwtAuthGuard, which reads the JWT from the `tj_auth_token` header, not the Basic-auth
+// token used by the /api/ext/* admin endpoints.
+async function getSessionJwt(appId: string): Promise<string> {
+  const cached = sessionJwtCache.get(appId);
+  if (cached) {
+    return cached;
+  }
+
+  const patUrl = `${API_HOST}/api/ext/users/personal-access-token`;
+  const patResponse = await fetch(patUrl, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Basic ${process.env.TOOLJET_ACCESS_TOKEN}`,
+    },
+    body: JSON.stringify({
+      email: process.env.TOOLJET_USER_EMAIL,
+      appId,
+    }),
+  });
+  if (!patResponse.ok) {
+    throw new Error(`Failed to generate PAT: ${patResponse.status} ${await patResponse.text()}`);
+  }
+  const { personalAccessToken } = (await patResponse.json()) as { personalAccessToken: string };
+
+  const sessionUrl = `${API_HOST}/api/ext/users/session`;
+  const sessionResponse = await fetch(sessionUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ appId, accessToken: personalAccessToken }),
+  });
+  if (!sessionResponse.ok) {
+    throw new Error(`Failed to create PAT session: ${sessionResponse.status} ${await sessionResponse.text()}`);
+  }
+  const { signedPat } = (await sessionResponse.json()) as { signedPat: string };
+
+  sessionJwtCache.set(appId, signedPat);
+  return signedPat;
+}
+
+// Create (or continue) an AI-builder conversation for an app.
+async function createConversation(
+  appId: string,
+  conversationType: string,
+  currentConversationId?: string
+): Promise<{ id: string; [key: string]: any }> {
+  const jwt = await getSessionJwt(appId);
+  const response = await fetch(`${API_HOST}/api/ai/conversation`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      tj_auth_token: jwt,
+    },
+    body: JSON.stringify({ appId, conversationType, currentConversationId }),
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to create conversation: ${response.status} ${await response.text()}`);
+  }
+  return (await response.json()) as { id: string; [key: string]: any };
+}
+
+// Send a build instruction on an existing conversation and consume the SSE stream until
+// the `finalMessage` event (or the stream closes). Returns the concatenated text content
+// of every `message`/`update_message`/`finalMessage` event, plus a list of file diffs seen.
+async function streamUserMessage(
+  appId: string,
+  conversationId: string,
+  content: string
+): Promise<{ finalMessage: any; events: Array<{ type: string; data: any }> }> {
+  const jwt = await getSessionJwt(appId);
+  const response = await fetch(`${API_HOST}/api/ai/conversation/message`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      tj_auth_token: jwt,
+    },
+    body: JSON.stringify({ conversationId, content, references: [] }),
+  });
+
+  if (!response.ok || !response.body) {
+    throw new Error(`Failed to send message: ${response.status} ${await response.text()}`);
+  }
+
+  const events: Array<{ type: string; data: any }> = [];
+  let finalMessage: any = null;
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    // SSE frames are separated by a blank line.
+    let boundary: number;
+    while ((boundary = buffer.indexOf("\n\n")) !== -1) {
+      const frame = buffer.slice(0, boundary);
+      buffer = buffer.slice(boundary + 2);
+
+      const eventLine = frame.split("\n").find((line) => line.startsWith("event: "));
+      const dataLine = frame.split("\n").find((line) => line.startsWith("data: "));
+      if (!eventLine || !dataLine) continue;
+
+      const type = eventLine.slice("event: ".length).trim();
+      const rawData = dataLine.slice("data: ".length);
+      let data: any;
+      try {
+        data = JSON.parse(rawData);
+      } catch {
+        data = rawData;
+      }
+
+      if (type === "heartbeat") continue;
+
+      events.push({ type, data });
+      if (type === "finalMessage") {
+        finalMessage = data;
+      }
+    }
+  }
+
+  return { finalMessage, events };
+}
+
 // Create server instance
 const server = new McpServer({
   name: "tooljet-mcp",
@@ -350,6 +481,50 @@ server.tool(
     },
 );
 
+
+// Register build-app tool: drives the AI app-builder pipeline via a conversation.
+server.tool(
+    "build-app",
+    "Start or continue an AI app-build conversation on a ToolJet app, and send a build/edit instruction to the app builder.",
+    {
+      app_id: z.string().describe("ID of the app to build/modify. Always ask the user."),
+      prompt: z.string().describe("Natural-language instruction describing what to build or change."),
+      conversation_id: z
+        .string()
+        .optional()
+        .describe("Existing conversation ID to continue. Omit to start a new build conversation."),
+    },
+    async ({ app_id, prompt, conversation_id }) => {
+      try {
+        const conversationId =
+          conversation_id ?? (await createConversation(app_id, "generate")).id;
+
+        const { finalMessage, events } = await streamUserMessage(app_id, conversationId, prompt);
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                conversationId,
+                finalMessage,
+                events,
+              }),
+            },
+          ],
+        };
+      } catch (error) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Failed to run AI builder: ${error instanceof Error ? error.message : String(error)}`,
+            },
+          ],
+        };
+      }
+    },
+);
 
 async function main() {
     const transport = new StdioServerTransport();

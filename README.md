@@ -41,12 +41,15 @@ Configure your MCP client (such as Claude, Cursor, etc.) to use this server. Mos
       ],
       "env": {
         "TOOLJET_ACCESS_TOKEN": "your-access-token",
-        "TOOLJET_HOST": "https://your-tooljet-instance.com"
+        "TOOLJET_HOST": "https://your-tooljet-instance.com",
+        "TOOLJET_USER_EMAIL": "your-tooljet-user-email"
       }
     }
   }
 }
 ```
+
+`TOOLJET_USER_EMAIL` is required for the `build-app` tool: it identifies the user the AI-builder session is created for when exchanging `TOOLJET_ACCESS_TOKEN` for a per-app session token.
 
 ### Platform-Specific Setup
 
@@ -99,6 +102,12 @@ ToolJet MCP provides several tools that AI assistants can use to interact with y
 | Tool | Description |
 |------|-------------|
 | `get-all-apps` | List all applications within a specific workspace |
+
+### AI App Builder
+
+| Tool | Description |
+|------|-------------|
+| `build-app` | Start or continue an AI app-build conversation and send a build/edit instruction to the app builder |
 
 ## Example Usage
 
