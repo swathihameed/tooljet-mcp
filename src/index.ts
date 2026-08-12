@@ -71,14 +71,54 @@ async function createConversation(
   return (await response.json()) as { id: string; [key: string]: any };
 }
 
+// Maps the artifact name on an interactive-widget response section to the interrupt `type`
+// the backend expects back in `interruptConfig.type` when resuming (server/ee/ai/service.ts).
+// Widgets that don't set a distinguishing artifact name (phase-plan approval, phase-complete,
+// upgrade gate) all resume through the same generic 'approval_response' shape.
+const ARTIFACT_NAME_TO_INTERRUPT_TYPE: Record<string, string> = {
+  "datasource-selection": "user_ds_selection",
+  entity_schema_review: "user_entity_selection",
+  "query-preview": "query_preview_shape",
+};
+
+// Inspect the last `update_message` event for an interactive-widget section. If present, the
+// conversation is paused awaiting a structured answer — surface what's pending so the caller
+// knows what `interrupt_type`/`interrupt_content` to send on the next `build-app` call.
+function detectPendingInterrupt(events: Array<{ type: string; data: any }>): any {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const event = events[i];
+    if (event.type !== "update_message") continue;
+
+    const sections = event.data?.metadata?.sections;
+    if (!Array.isArray(sections)) continue;
+
+    const widget = sections.find((s: any) => s?.type === "output-widget-interactive");
+    if (!widget) continue;
+
+    const artifactName = widget.header?.artifact?.name;
+    const type = (artifactName && ARTIFACT_NAME_TO_INTERRUPT_TYPE[artifactName]) || "approval_response";
+
+    return {
+      type,
+      suggestions: event.data.metadata.resumeSuggestions ?? widget.responseActions ?? [],
+    };
+  }
+  return null;
+}
+
 // Send a build instruction on an existing conversation and consume the SSE stream until
 // the `finalMessage` event (or the stream closes). Returns the concatenated text content
 // of every `message`/`update_message`/`finalMessage` event, plus a list of file diffs seen.
 async function streamUserMessage(
   appId: string,
   conversationId: string,
-  content: string
-): Promise<{ finalMessage: any; events: Array<{ type: string; data: any }> }> {
+  content: string,
+  interruptConfig?: { type: string; content: any }
+): Promise<{
+  finalMessage: any;
+  events: Array<{ type: string; data: any }>;
+  pendingInterrupt: any;
+}> {
   const jwt = await getSessionJwt(appId);
   const response = await fetch(`${API_HOST}/api/ai/conversation/message`, {
     method: "POST",
@@ -86,7 +126,12 @@ async function streamUserMessage(
       "Content-Type": "application/json",
       tj_auth_token: jwt,
     },
-    body: JSON.stringify({ conversationId, content, references: [] }),
+    body: JSON.stringify({
+      conversationId,
+      content,
+      references: [],
+      ...(interruptConfig ? { interruptConfig } : {}),
+    }),
   });
 
   if (!response.ok || !response.body) {
@@ -133,7 +178,7 @@ async function streamUserMessage(
     }
   }
 
-  return { finalMessage, events };
+  return { finalMessage, events, pendingInterrupt: detectPendingInterrupt(events) };
 }
 
 // Create server instance
@@ -482,10 +527,45 @@ server.tool(
 );
 
 
+// Structured answers for a pending interrupt, keyed by `interrupt_type`. Shapes mirror what
+// ToolJet's frontend sends back in `interruptConfig.content` for each widget
+// (frontend/ee/modules/AiBuilder/components/TooljetAIChat/InteractiveWidget/index.jsx).
+const interruptContentSchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("approval_response"),
+    label: z.string().describe("The chosen option's label, e.g. 'Approve & start phase 1' or 'Skip this step'."),
+  }),
+  z.object({
+    type: z.literal("spec_doc_user_update"),
+    document: z.string().describe("The full updated specification document text."),
+  }),
+  z.object({
+    type: z.literal("user_ds_selection"),
+    selections: z
+      .array(
+        z.object({
+          datasource_id: z.string(),
+          datasource_kind: z.string().optional(),
+        })
+      )
+      .describe("The datasource(s) the user selected."),
+  }),
+  z.object({
+    type: z.literal("user_entity_selection"),
+    selections: z.array(z.record(z.any())).describe("The table/entity records the user selected."),
+  }),
+  z.object({
+    type: z.literal("query_preview_shape"),
+    status: z.enum(["accepted", "declined"]),
+    shape: z.record(z.any()).optional().describe("Structure-only digest of the previewed query result."),
+  }),
+]);
+
 // Register build-app tool: drives the AI app-builder pipeline via a conversation.
 server.tool(
     "build-app",
-    "Start or continue an AI app-build conversation on a ToolJet app, and send a build/edit instruction to the app builder.",
+    "Start or continue an AI app-build conversation on a ToolJet app, and send a build/edit instruction to the app builder. " +
+      "If a previous call returned `pendingInterrupt`, answer it by passing `interrupt_content` matching its `type` (in addition to `prompt`).",
     {
       app_id: z.string().describe("ID of the app to build/modify. Always ask the user."),
       prompt: z.string().describe("Natural-language instruction describing what to build or change."),
@@ -493,13 +573,50 @@ server.tool(
         .string()
         .optional()
         .describe("Existing conversation ID to continue. Omit to start a new build conversation."),
+      interrupt_content: interruptContentSchema
+        .optional()
+        .describe(
+          "Structured answer to a pending interrupt reported by a previous call's `pendingInterrupt` field. Omit unless resuming one."
+        ),
     },
-    async ({ app_id, prompt, conversation_id }) => {
+    async ({ app_id, prompt, conversation_id, interrupt_content }) => {
       try {
         const conversationId =
           conversation_id ?? (await createConversation(app_id, "generate")).id;
 
-        const { finalMessage, events } = await streamUserMessage(app_id, conversationId, prompt);
+        let interruptConfig: { type: string; content: any } | undefined;
+        if (interrupt_content) {
+          switch (interrupt_content.type) {
+            case "approval_response":
+              interruptConfig = {
+                type: interrupt_content.type,
+                content: { selectedLabel: interrupt_content.label, action: interrupt_content.label },
+              };
+              break;
+            case "spec_doc_user_update":
+              interruptConfig = { type: interrupt_content.type, content: interrupt_content.document };
+              break;
+            case "user_ds_selection":
+              interruptConfig = { type: interrupt_content.type, content: interrupt_content.selections };
+              break;
+            case "user_entity_selection":
+              interruptConfig = { type: interrupt_content.type, content: interrupt_content.selections };
+              break;
+            case "query_preview_shape":
+              interruptConfig = {
+                type: interrupt_content.type,
+                content: { status: interrupt_content.status, ...(interrupt_content.shape ?? {}) },
+              };
+              break;
+          }
+        }
+
+        const { finalMessage, events, pendingInterrupt } = await streamUserMessage(
+          app_id,
+          conversationId,
+          prompt,
+          interruptConfig
+        );
 
         return {
           content: [
@@ -508,6 +625,7 @@ server.tool(
               text: JSON.stringify({
                 conversationId,
                 finalMessage,
+                pendingInterrupt,
                 events,
               }),
             },

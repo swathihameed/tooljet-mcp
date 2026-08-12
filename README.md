@@ -109,6 +109,19 @@ ToolJet MCP provides several tools that AI assistants can use to interact with y
 |------|-------------|
 | `build-app` | Start or continue an AI app-build conversation and send a build/edit instruction to the app builder |
 
+`build-app` can pause the conversation waiting on a user decision (choose a datasource, approve a
+phase plan, review a query preview, etc). When that happens, the tool's response includes a
+`pendingInterrupt: { type, suggestions }` field. To resume, call `build-app` again with the same
+`conversation_id` and an `interrupt_content` object matching `pendingInterrupt.type`:
+
+| `pendingInterrupt.type` | `interrupt_content` shape |
+|---|---|
+| `approval_response` | `{ type: "approval_response", label: "Approve & start phase 1" }` |
+| `user_ds_selection` | `{ type: "user_ds_selection", selections: [{ datasource_id: "..." }] }` |
+| `user_entity_selection` | `{ type: "user_entity_selection", selections: [{ ... }] }` |
+| `spec_doc_user_update` | `{ type: "spec_doc_user_update", document: "..." }` |
+| `query_preview_shape` | `{ type: "query_preview_shape", status: "accepted" \| "declined", shape?: {...} }` |
+
 ## Example Usage
 
 Once configured, your AI assistant can perform tasks like:
