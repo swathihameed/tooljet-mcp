@@ -71,6 +71,20 @@ async function createConversation(
   return (await response.json()) as { id: string; [key: string]: any };
 }
 
+// GET helper for /api/ai/* endpoints, JWT-authed the same way build-app is. The JWT is minted
+// per-appId (see getSessionJwt), so even endpoints that aren't conceptually app-scoped
+// (taggable-datasources, get-credits-balance) still require an app_id to obtain a token.
+async function aiApiGet(appId: string, path: string): Promise<any> {
+  const jwt = await getSessionJwt(appId);
+  const response = await fetch(`${API_HOST}/api/ai/${path}`, {
+    headers: { tj_auth_token: jwt },
+  });
+  if (!response.ok) {
+    throw new Error(`GET ${path} failed: ${response.status} ${await response.text()}`);
+  }
+  return response.json();
+}
+
 // Maps the artifact name on an interactive-widget response section to the interrupt `type`
 // the backend expects back in `interruptConfig.type` when resuming (server/ee/ai/service.ts).
 // Widgets that don't set a distinguishing artifact name (phase-plan approval, phase-complete,
@@ -78,10 +92,144 @@ async function createConversation(
 const ARTIFACT_NAME_TO_INTERRUPT_TYPE: Record<string, string> = {
   "datasource-selection": "user_ds_selection",
   entity_schema_review: "user_entity_selection",
+  "entity-mapping": "user_entity_selection",
+  review_module_prd: "spec_doc_user_update",
   "query-preview": "query_preview_shape",
 };
 
-// Inspect the last `update_message` event for an interactive-widget section. If present, the
+// Renders a datasource-selection / approval-style choice as a numbered Markdown menu.
+// MCP text content has no real dropdown/checkbox widget, so the closest usable analog is a
+// list the caller can pick from and echo the id/label back in the next `interrupt_content`.
+function renderSelectionMenu(
+  heading: string,
+  options: Array<{ label: string; id?: string; suffix?: string; preSelected?: boolean }>,
+  instructions: string
+): string {
+  const lines = [`### ${heading}`, ""];
+  options.forEach((opt, i) => {
+    const idPart = opt.id ? ` (id: \`${opt.id}\`)` : "";
+    const suffixPart = opt.suffix ? ` — ${opt.suffix}` : "";
+    const marker = opt.preSelected ? "  ← pre-selected" : "";
+    lines.push(`${i + 1}. **${opt.label}**${idPart}${suffixPart}${marker}`);
+  });
+  lines.push("", instructions);
+  return lines.join("\n");
+}
+
+// Builds human-readable Markdown for a pending interrupt's artifact content, mirroring how
+// the ToolJet UI itself presents each widget type (OutputWidget/InteractiveWidget). Falls back
+// to a plain note rather than throwing if the artifact shape doesn't match a known case.
+function buildInterruptDisplay(type: string, widget: any, message: any): string {
+  const artifact = widget.header?.artifact ?? {};
+  const content = artifact.content;
+
+  switch (type) {
+    case "user_ds_selection": {
+      const optionIds: string[] = artifact.optionDatasourceIds ?? [];
+      if (!optionIds.length) {
+        return "### Select a datasource\n\nNo pre-filled datasource candidates were provided (this happens when the datasource wasn't @-tagged/mentioned). Use `get-taggable-datasources` to fetch the full candidate list, then reply with the chosen `datasource_id`(s) via `interrupt_content`.";
+      }
+      const options = optionIds.map((id) => ({
+        label: id,
+        id,
+        suffix: artifact.preFillKind ? `kind: ${artifact.preFillKind}` : undefined,
+        preSelected: id === artifact.preSelectedDatasourceId,
+      }));
+      return renderSelectionMenu(
+        "Select a datasource",
+        options,
+        "Reply with the datasource_id(s) to select via `interrupt_content` (type: user_ds_selection)."
+      );
+    }
+
+    case "user_entity_selection": {
+      const rows: Array<{ entity_name: string; tables: Array<{ name: string; kind: string }> }> =
+        artifact.name === "entity_schema_review" ? content?.ui ?? [] : content ?? [];
+      if (!Array.isArray(rows) || !rows.length) {
+        return "### Entity/table mapping\n\nNo mapping rows found in the artifact.";
+      }
+      const lines = ["### Entity/table mapping", "", "| Entity | Tables |", "|---|---|"];
+      for (const row of rows) {
+        const tables = (row.tables ?? []).map((t) => `${t.name} (${t.kind})`).join(", ");
+        lines.push(`| ${row.entity_name} | ${tables} |`);
+      }
+      lines.push("", "Reply with the selected entity/table records via `interrupt_content` (type: user_entity_selection).");
+      return lines.join("\n");
+    }
+
+    case "spec_doc_user_update": {
+      const sections: Array<{ sectionName?: string; content?: string; text?: string }> = Array.isArray(content)
+        ? content
+        : [];
+      if (!sections.length) {
+        return "### Specification document\n\nNo document sections found in the artifact.";
+      }
+      const doc = sections
+        .map((s) => `## ${s.sectionName ?? "Section"}\n\n${s.content ?? s.text ?? ""}`)
+        .join("\n\n");
+      return `${doc}\n\n---\nReply with the edited document via \`interrupt_content\` (type: spec_doc_user_update) to update it, or approve as-is.`;
+    }
+
+    case "query_preview_shape": {
+      const queryName = content?.query_name ?? "unknown";
+      const queryId = content?.query_id ?? "unknown";
+      return `### Query preview\n\n- **Query name:** ${queryName}\n- **Query id:** \`${queryId}\`\n\nReply via \`interrupt_content\` (type: query_preview_shape) with \`status: "accepted"\` or \`"declined"\`.`;
+    }
+
+    case "approval_response":
+    default: {
+      const header = widget.header ?? {};
+      const responseActions: Array<string | { label: string; isCustom?: boolean }> = widget.responseActions ?? [];
+      const primaryCta: Array<{ id: string; label: string }> = widget.primaryCta ?? [];
+      const lines = [`### ${header.title ?? "Review needed"}`];
+      if (header.subtitle) lines.push("", header.subtitle);
+      if (responseActions.length) {
+        lines.push("", "Options:");
+        responseActions.forEach((opt, i) => {
+          const label = typeof opt === "string" ? opt : opt.label;
+          lines.push(`${i + 1}. ${label}`);
+        });
+      }
+      if (primaryCta.length) {
+        lines.push("", `Actions: ${primaryCta.map((c) => c.label).join(", ")}`);
+      }
+      if (!responseActions.length && !primaryCta.length && !header.title) {
+        return "Structured data available for this interrupt, see raw events for details.";
+      }
+      lines.push("", "Reply with the chosen label via `interrupt_content` (type: approval_response).");
+      return lines.join("\n");
+    }
+  }
+}
+
+// Inspect a single AI message for an interactive-widget section. If present, the conversation
+// is paused awaiting a structured answer — surface what's pending (including a human-readable
+// `display` rendering of the artifact) so the caller knows what to send on the next call.
+function detectPendingInterruptFromMessage(message: any): any {
+  const sections = message?.metadata?.sections;
+  if (!Array.isArray(sections)) return null;
+
+  const widget = sections.find((s: any) => s?.type === "output-widget-interactive");
+  if (!widget) return null;
+
+  const artifactName = widget.header?.artifact?.name;
+  const type = (artifactName && ARTIFACT_NAME_TO_INTERRUPT_TYPE[artifactName]) || "approval_response";
+
+  let display: string;
+  try {
+    display = buildInterruptDisplay(type, widget, message);
+  } catch {
+    display = "Structured data available for this interrupt, see raw events for details.";
+  }
+
+  return {
+    type,
+    suggestions: message.metadata.resumeSuggestions ?? widget.responseActions ?? [],
+    display,
+  };
+}
+
+// Inspect the last `update_message` event for a pending interrupt. If present, the
 // conversation is paused awaiting a structured answer — surface what's pending so the caller
 // knows what `interrupt_type`/`interrupt_content` to send on the next `build-app` call.
 function detectPendingInterrupt(events: Array<{ type: string; data: any }>): any {
@@ -89,19 +237,8 @@ function detectPendingInterrupt(events: Array<{ type: string; data: any }>): any
     const event = events[i];
     if (event.type !== "update_message") continue;
 
-    const sections = event.data?.metadata?.sections;
-    if (!Array.isArray(sections)) continue;
-
-    const widget = sections.find((s: any) => s?.type === "output-widget-interactive");
-    if (!widget) continue;
-
-    const artifactName = widget.header?.artifact?.name;
-    const type = (artifactName && ARTIFACT_NAME_TO_INTERRUPT_TYPE[artifactName]) || "approval_response";
-
-    return {
-      type,
-      suggestions: event.data.metadata.resumeSuggestions ?? widget.responseActions ?? [],
-    };
+    const pending = detectPendingInterruptFromMessage(event.data);
+    if (pending) return pending;
   }
   return null;
 }
@@ -526,6 +663,153 @@ server.tool(
     },
 );
 
+
+// Register get-conversation tool: fetches a conversation's current state, and — since this
+// reads the same message data the AI-builder UI reads — reconstructs `pendingInterrupt` the
+// same way build-app does. Lets a caller check whether a conversation is paused (e.g. because
+// a human already resolved it via the ToolJet UI) before sending a new message.
+server.tool(
+  "get-conversation",
+  "Get a conversation's current state (messages, metadata). Also reports `pendingInterrupt` " +
+    "if the conversation is currently paused awaiting a structured answer.",
+  {
+    app_id: z.string().describe("ID of the app the conversation belongs to. Always ask the user."),
+    conversation_id: z.string().describe("ID of the conversation to fetch. Always ask the user."),
+  },
+  async ({ app_id, conversation_id }) => {
+    try {
+      const conversation = await aiApiGet(app_id, `conversation/${conversation_id}`);
+      const messages = conversation?.aiConversationMessages ?? [];
+      const latestMessage = messages[messages.length - 1];
+      const pendingInterrupt = latestMessage ? detectPendingInterruptFromMessage(latestMessage) : null;
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ conversation, pendingInterrupt }),
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Failed to get conversation: ${error instanceof Error ? error.message : String(error)}`,
+          },
+        ],
+      };
+    }
+  }
+);
+
+// Register list-conversations tool.
+server.tool(
+  "list-conversations",
+  "List an app's AI-builder conversations.",
+  {
+    app_id: z.string().describe("ID of the app to list conversations for. Always ask the user."),
+    conversation_type: z
+      .string()
+      .optional()
+      .describe("Conversation type filter, e.g. 'generate'. Defaults to 'generate' if omitted."),
+  },
+  async ({ app_id, conversation_type }) => {
+    try {
+      const type = conversation_type ?? "generate";
+      const conversations = await aiApiGet(
+        app_id,
+        `conversations?appId=${encodeURIComponent(app_id)}&conversationType=${encodeURIComponent(type)}`
+      );
+      return { content: [{ type: "text", text: JSON.stringify(conversations) }] };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Failed to list conversations: ${error instanceof Error ? error.message : String(error)}`,
+          },
+        ],
+      };
+    }
+  }
+);
+
+// Register get-taggable-datasources tool: gives the caller a real candidate list for
+// `user_ds_selection` interrupts when the artifact didn't pre-fill `optionDatasourceIds`
+// (i.e. the datasource wasn't @-tagged/mentioned by the user).
+server.tool(
+  "get-taggable-datasources",
+  "Get the datasources the user can reference/select in an AI-builder conversation for this app.",
+  {
+    app_id: z.string().describe("ID of an app, used only to obtain a session token. Always ask the user."),
+  },
+  async ({ app_id }) => {
+    try {
+      const datasources = await aiApiGet(app_id, "taggable-datasources");
+      return { content: [{ type: "text", text: JSON.stringify(datasources) }] };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Failed to get taggable datasources: ${error instanceof Error ? error.message : String(error)}`,
+          },
+        ],
+      };
+    }
+  }
+);
+
+// Register get-credits-balance tool.
+server.tool(
+  "get-credits-balance",
+  "Get the current AI credits balance for the organization.",
+  {
+    app_id: z.string().describe("ID of an app, used only to obtain a session token. Always ask the user."),
+  },
+  async ({ app_id }) => {
+    try {
+      const balance = await aiApiGet(app_id, "get-credits-balance");
+      return { content: [{ type: "text", text: JSON.stringify(balance) }] };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Failed to get credits balance: ${error instanceof Error ? error.message : String(error)}`,
+          },
+        ],
+      };
+    }
+  }
+);
+
+// Register get-thread-token-usage tool.
+server.tool(
+  "get-thread-token-usage",
+  "Get token usage for an AI-builder conversation thread.",
+  {
+    app_id: z.string().describe("ID of the app the conversation belongs to. Always ask the user."),
+    conversation_id: z.string().describe("ID of the conversation to get token usage for. Always ask the user."),
+  },
+  async ({ app_id, conversation_id }) => {
+    try {
+      const usage = await aiApiGet(app_id, `conversation/${conversation_id}/token-usage`);
+      return { content: [{ type: "text", text: JSON.stringify(usage) }] };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Failed to get token usage: ${error instanceof Error ? error.message : String(error)}`,
+          },
+        ],
+      };
+    }
+  }
+);
 
 // Structured answers for a pending interrupt, keyed by `interrupt_type`. Shapes mirror what
 // ToolJet's frontend sends back in `interruptConfig.content` for each widget
