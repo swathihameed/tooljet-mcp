@@ -4,50 +4,36 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 
 const API_HOST = `${process.env.TOOLJET_HOST}`;
+const AI_EXT_BASE = `${API_HOST}/api/ext/ai`;
 
-// Cache of appId -> signed JWT, so we only do the PAT -> session exchange once per app.
-const sessionJwtCache = new Map<string, string>();
+// SSE reads (and, loosely, the overall build-app call) get aborted if no data arrives for this
+// long, so a stalled agent pipeline can't hang the tool call forever.
+const SSE_IDLE_TIMEOUT_MS = 120_000;
 
-// Exchange the static TOOLJET_ACCESS_TOKEN for a short-lived PAT, then exchange that PAT
-// for a signed JWT scoped to the given app. The AI conversation endpoints are guarded by
-// JwtAuthGuard, which reads the JWT from the `tj_auth_token` header, not the Basic-auth
-// token used by the /api/ext/* admin endpoints.
-async function getSessionJwt(appId: string): Promise<string> {
-  const cached = sessionJwtCache.get(appId);
-  if (cached) {
-    return cached;
+// All AI-flow calls go through the same /api/ext/* Basic-auth protocol the other 6 tools
+// already use — no more per-app JWT minting. Interim: the acting user is still identified by
+// TOOLJET_USER_EMAIL on every request (same impersonation-capable pattern as before, just one
+// less hop); a per-user token will replace this once the auth rework lands (see
+// .claude/tj_plans/tj_mcp_ai_flow.md).
+function extAuthHeaders(extra?: Record<string, string>): Record<string, string> {
+  return {
+    Authorization: `Basic ${process.env.TOOLJET_ACCESS_TOKEN}`,
+    ...extra,
+  };
+}
+
+// GET helper for /api/ext/ai/* endpoints.
+async function aiApiGet(path: string, params: Record<string, string | undefined>): Promise<any> {
+  const query = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined) query.set(key, value);
   }
-
-  const patUrl = `${API_HOST}/api/ext/users/personal-access-token`;
-  const patResponse = await fetch(patUrl, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Basic ${process.env.TOOLJET_ACCESS_TOKEN}`,
-    },
-    body: JSON.stringify({
-      email: process.env.TOOLJET_USER_EMAIL,
-      appId,
-    }),
-  });
-  if (!patResponse.ok) {
-    throw new Error(`Failed to generate PAT: ${patResponse.status} ${await patResponse.text()}`);
+  const url = `${AI_EXT_BASE}/${path}?${query.toString()}`;
+  const response = await fetch(url, { headers: extAuthHeaders() });
+  if (!response.ok) {
+    throw new Error(`GET ${path} failed: ${response.status} ${await response.text()}`);
   }
-  const { personalAccessToken } = (await patResponse.json()) as { personalAccessToken: string };
-
-  const sessionUrl = `${API_HOST}/api/ext/users/session`;
-  const sessionResponse = await fetch(sessionUrl, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ appId, accessToken: personalAccessToken }),
-  });
-  if (!sessionResponse.ok) {
-    throw new Error(`Failed to create PAT session: ${sessionResponse.status} ${await sessionResponse.text()}`);
-  }
-  const { signedPat } = (await sessionResponse.json()) as { signedPat: string };
-
-  sessionJwtCache.set(appId, signedPat);
-  return signedPat;
+  return response.json();
 }
 
 // Create (or continue) an AI-builder conversation for an app.
@@ -56,33 +42,20 @@ async function createConversation(
   conversationType: string,
   currentConversationId?: string
 ): Promise<{ id: string; [key: string]: any }> {
-  const jwt = await getSessionJwt(appId);
-  const response = await fetch(`${API_HOST}/api/ai/conversation`, {
+  const response = await fetch(`${AI_EXT_BASE}/conversation`, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      tj_auth_token: jwt,
-    },
-    body: JSON.stringify({ appId, conversationType, currentConversationId }),
+    headers: extAuthHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify({
+      email: process.env.TOOLJET_USER_EMAIL,
+      appId,
+      conversationType,
+      currentConversationId,
+    }),
   });
   if (!response.ok) {
     throw new Error(`Failed to create conversation: ${response.status} ${await response.text()}`);
   }
   return (await response.json()) as { id: string; [key: string]: any };
-}
-
-// GET helper for /api/ai/* endpoints, JWT-authed the same way build-app is. The JWT is minted
-// per-appId (see getSessionJwt), so even endpoints that aren't conceptually app-scoped
-// (taggable-datasources, get-credits-balance) still require an app_id to obtain a token.
-async function aiApiGet(appId: string, path: string): Promise<any> {
-  const jwt = await getSessionJwt(appId);
-  const response = await fetch(`${API_HOST}/api/ai/${path}`, {
-    headers: { tj_auth_token: jwt },
-  });
-  if (!response.ok) {
-    throw new Error(`GET ${path} failed: ${response.status} ${await response.text()}`);
-  }
-  return response.json();
 }
 
 // Maps the artifact name on an interactive-widget response section to the interrupt `type`
@@ -256,14 +229,12 @@ async function streamUserMessage(
   events: Array<{ type: string; data: any }>;
   pendingInterrupt: any;
 }> {
-  const jwt = await getSessionJwt(appId);
-  const response = await fetch(`${API_HOST}/api/ai/conversation/message`, {
+  const response = await fetch(`${AI_EXT_BASE}/conversation/message`, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      tj_auth_token: jwt,
-    },
+    headers: extAuthHeaders({ "Content-Type": "application/json" }),
     body: JSON.stringify({
+      email: process.env.TOOLJET_USER_EMAIL,
+      appId,
       conversationId,
       content,
       references: [],
@@ -282,40 +253,130 @@ async function streamUserMessage(
   const decoder = new TextDecoder();
   let buffer = "";
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
+  try {
+    while (true) {
+      // Race each read against an idle timeout so a stalled pipeline (agent hung, connection
+      // dropped without closing) can't block the tool call forever. Heartbeat frames from the
+      // backend (every 5s under normal operation) keep resetting this, so it only fires on a
+      // genuine stall.
+      let timeoutHandle: ReturnType<typeof setTimeout>;
+      const timeout = new Promise<never>((_, reject) => {
+        timeoutHandle = setTimeout(
+          () => reject(new Error(`SSE stream idle for over ${SSE_IDLE_TIMEOUT_MS / 1000}s, aborting.`)),
+          SSE_IDLE_TIMEOUT_MS
+        );
+      });
 
-    // SSE frames are separated by a blank line.
-    let boundary: number;
-    while ((boundary = buffer.indexOf("\n\n")) !== -1) {
-      const frame = buffer.slice(0, boundary);
-      buffer = buffer.slice(boundary + 2);
-
-      const eventLine = frame.split("\n").find((line) => line.startsWith("event: "));
-      const dataLine = frame.split("\n").find((line) => line.startsWith("data: "));
-      if (!eventLine || !dataLine) continue;
-
-      const type = eventLine.slice("event: ".length).trim();
-      const rawData = dataLine.slice("data: ".length);
-      let data: any;
+      let done: boolean, value: Uint8Array | undefined;
       try {
-        data = JSON.parse(rawData);
-      } catch {
-        data = rawData;
+        ({ done, value } = await Promise.race([reader.read(), timeout]));
+      } finally {
+        clearTimeout(timeoutHandle!);
       }
 
-      if (type === "heartbeat") continue;
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
 
-      events.push({ type, data });
-      if (type === "finalMessage") {
-        finalMessage = data;
+      // SSE frames are separated by a blank line.
+      let boundary: number;
+      while ((boundary = buffer.indexOf("\n\n")) !== -1) {
+        const frame = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+
+        const eventLine = frame.split("\n").find((line) => line.startsWith("event: "));
+        const dataLine = frame.split("\n").find((line) => line.startsWith("data: "));
+        if (!eventLine || !dataLine) continue;
+
+        const type = eventLine.slice("event: ".length).trim();
+        const rawData = dataLine.slice("data: ".length);
+        let data: any;
+        try {
+          data = JSON.parse(rawData);
+        } catch {
+          data = rawData;
+        }
+
+        if (type === "heartbeat") continue;
+
+        events.push({ type, data });
+        if (type === "finalMessage") {
+          finalMessage = data;
+        }
       }
     }
+  } catch (error) {
+    // Surface whatever we already collected instead of losing it, but make sure the caller
+    // knows the stream didn't complete normally.
+    await reader.cancel().catch(() => {});
+    events.push({ type: "stream_error", data: { message: error instanceof Error ? error.message : String(error) } });
   }
 
-  return { finalMessage, events, pendingInterrupt: detectPendingInterrupt(events) };
+  const pendingInterrupt = detectPendingInterrupt(events);
+  // The backend only ever emits a `finalMessage` SSE event for a narrow set of cases — most
+  // successful builds (and the insufficient-credits / archived-conversation error paths) end
+  // the stream after an `update_message`/`message` event with no `finalMessage` at all. Without
+  // a pending interrupt to explain the silence, derive a result from the last substantive
+  // message instead of returning a bare `null` that looks identical for success and failure.
+  if (!finalMessage && !pendingInterrupt) {
+    finalMessage = deriveFinalMessage(events);
+  }
+
+  return { finalMessage, events, pendingInterrupt };
+}
+
+// Fallback for when the backend ends the SSE stream without an explicit `finalMessage` event.
+// Walks events backwards looking for the last non-interactive AI message with real content,
+// and flags it as an error if it matches the known insufficient-credits/archived-conversation
+// shapes (see ToolJet/server/ee/ai/service.ts sendUserMessage's early-return error paths).
+function deriveFinalMessage(events: Array<{ type: string; data: any }>): { content: string; isError: boolean } | null {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const event = events[i];
+    if (event.type === "stream_error") {
+      return { content: event.data.message, isError: true };
+    }
+    if (event.type !== "update_message" && event.type !== "message") continue;
+
+    const metadata = event.data?.metadata;
+    const sections = metadata?.sections;
+    if (Array.isArray(sections) && sections.length) {
+      if (sections.some((s: any) => s?.type === "output-widget-interactive")) continue; // handled via pendingInterrupt
+
+      // section.content is usually a plain string (markdown sections), but the non-markdown
+      // shape used by generateErrorMessageForUser wraps it one level deeper as
+      // [{..., content: theActualString}] — unwrap both shapes rather than stringifying the
+      // array via join() (which previously produced literal "[object Object]").
+      const sectionText = sections
+        .filter((s: any) => !s.ephemeral)
+        .map((s: any) => {
+          if (typeof s.content === "string") return s.content;
+          if (Array.isArray(s.content)) {
+            return s.content
+              .map((c: any) => (typeof c === "string" ? c : c?.content))
+              .filter((c: any) => typeof c === "string")
+              .join("\n");
+          }
+          return null;
+        })
+        .filter(Boolean)
+        .join("\n\n");
+
+      const isError = Boolean(metadata.creditsError || metadata.action_button_type === "credits-error");
+      // The plain top-level `content` field (set directly by e.g. generateErrorMessageForUser)
+      // is the authoritative text for error messages — prefer it over the derived section text.
+      const content = isError && typeof event.data?.content === "string" && event.data.content.trim()
+        ? event.data.content
+        : sectionText;
+
+      if (content) {
+        return { content, isError };
+      }
+    }
+
+    if (typeof event.data?.content === "string" && event.data.content.trim() && event.data.messageType === "ai") {
+      return { content: event.data.content, isError: false };
+    }
+  }
+  return null;
 }
 
 // Create server instance
@@ -673,12 +734,13 @@ server.tool(
   "Get a conversation's current state (messages, metadata). Also reports `pendingInterrupt` " +
     "if the conversation is currently paused awaiting a structured answer.",
   {
-    app_id: z.string().describe("ID of the app the conversation belongs to. Always ask the user."),
     conversation_id: z.string().describe("ID of the conversation to fetch. Always ask the user."),
   },
-  async ({ app_id, conversation_id }) => {
+  async ({ conversation_id }) => {
     try {
-      const conversation = await aiApiGet(app_id, `conversation/${conversation_id}`);
+      const conversation = await aiApiGet(`conversation/${conversation_id}`, {
+        email: process.env.TOOLJET_USER_EMAIL,
+      });
       const messages = conversation?.aiConversationMessages ?? [];
       const latestMessage = messages[messages.length - 1];
       const pendingInterrupt = latestMessage ? detectPendingInterruptFromMessage(latestMessage) : null;
@@ -717,11 +779,11 @@ server.tool(
   },
   async ({ app_id, conversation_type }) => {
     try {
-      const type = conversation_type ?? "generate";
-      const conversations = await aiApiGet(
-        app_id,
-        `conversations?appId=${encodeURIComponent(app_id)}&conversationType=${encodeURIComponent(type)}`
-      );
+      const conversations = await aiApiGet("conversations", {
+        email: process.env.TOOLJET_USER_EMAIL,
+        appId: app_id,
+        conversationType: conversation_type ?? "generate",
+      });
       return { content: [{ type: "text", text: JSON.stringify(conversations) }] };
     } catch (error) {
       return {
@@ -743,11 +805,14 @@ server.tool(
   "get-taggable-datasources",
   "Get the datasources the user can reference/select in an AI-builder conversation for this app.",
   {
-    app_id: z.string().describe("ID of an app, used only to obtain a session token. Always ask the user."),
+    app_id: z.string().describe("ID of an app, used to resolve the organization's datasources. Always ask the user."),
   },
   async ({ app_id }) => {
     try {
-      const datasources = await aiApiGet(app_id, "taggable-datasources");
+      const datasources = await aiApiGet("taggable-datasources", {
+        email: process.env.TOOLJET_USER_EMAIL,
+        appId: app_id,
+      });
       return { content: [{ type: "text", text: JSON.stringify(datasources) }] };
     } catch (error) {
       return {
@@ -767,11 +832,14 @@ server.tool(
   "get-credits-balance",
   "Get the current AI credits balance for the organization.",
   {
-    app_id: z.string().describe("ID of an app, used only to obtain a session token. Always ask the user."),
+    app_id: z.string().describe("ID of an app, used to resolve the organization's credits balance. Always ask the user."),
   },
   async ({ app_id }) => {
     try {
-      const balance = await aiApiGet(app_id, "get-credits-balance");
+      const balance = await aiApiGet("get-credits-balance", {
+        email: process.env.TOOLJET_USER_EMAIL,
+        appId: app_id,
+      });
       return { content: [{ type: "text", text: JSON.stringify(balance) }] };
     } catch (error) {
       return {
@@ -791,12 +859,13 @@ server.tool(
   "get-thread-token-usage",
   "Get token usage for an AI-builder conversation thread.",
   {
-    app_id: z.string().describe("ID of the app the conversation belongs to. Always ask the user."),
     conversation_id: z.string().describe("ID of the conversation to get token usage for. Always ask the user."),
   },
-  async ({ app_id, conversation_id }) => {
+  async ({ conversation_id }) => {
     try {
-      const usage = await aiApiGet(app_id, `conversation/${conversation_id}/token-usage`);
+      const usage = await aiApiGet(`conversation/${conversation_id}/token-usage`, {
+        email: process.env.TOOLJET_USER_EMAIL,
+      });
       return { content: [{ type: "text", text: JSON.stringify(usage) }] };
     } catch (error) {
       return {
@@ -903,6 +972,7 @@ server.tool(
         );
 
         return {
+          isError: Boolean(finalMessage?.isError),
           content: [
             {
               type: "text",

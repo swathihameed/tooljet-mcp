@@ -49,7 +49,7 @@ Configure your MCP client (such as Claude, Cursor, etc.) to use this server. Mos
 }
 ```
 
-`TOOLJET_USER_EMAIL` is required for the `build-app` tool: it identifies the user the AI-builder session is created for when exchanging `TOOLJET_ACCESS_TOKEN` for a per-app session token.
+`TOOLJET_USER_EMAIL` is required for the AI App Builder tools (`build-app` and the 5 tools below it): it identifies which user the AI-builder action is performed as.
 
 ### Platform-Specific Setup
 
@@ -108,19 +108,31 @@ ToolJet MCP provides several tools that AI assistants can use to interact with y
 | Tool | Description |
 |------|-------------|
 | `build-app` | Start or continue an AI app-build conversation and send a build/edit instruction to the app builder |
+| `get-conversation` | Get a conversation's current state (messages, metadata) and check if it's paused awaiting a structured answer |
+| `list-conversations` | List an app's AI-builder conversations |
+| `get-taggable-datasources` | Get the datasources you can reference/select in an AI-builder conversation for an app |
+| `get-credits-balance` | Get the current AI credits balance for the organization |
+| `get-thread-token-usage` | Get token usage for an AI-builder conversation thread |
 
 `build-app` can pause the conversation waiting on a user decision (choose a datasource, approve a
 phase plan, review a query preview, etc). When that happens, the tool's response includes a
-`pendingInterrupt: { type, suggestions }` field. To resume, call `build-app` again with the same
-`conversation_id` and an `interrupt_content` object matching `pendingInterrupt.type`:
+`pendingInterrupt: { type, suggestions, display }` field — `display` is ready-to-read Markdown
+(a selection menu, an entity/table mapping table, or the full spec document, depending on the
+type) meant to be shown directly to whoever needs to make the decision. To resume, call
+`build-app` again with the same `conversation_id` and an `interrupt_content` object matching
+`pendingInterrupt.type`:
 
-| `pendingInterrupt.type` | `interrupt_content` shape |
-|---|---|
-| `approval_response` | `{ type: "approval_response", label: "Approve & start phase 1" }` |
-| `user_ds_selection` | `{ type: "user_ds_selection", selections: [{ datasource_id: "..." }] }` |
-| `user_entity_selection` | `{ type: "user_entity_selection", selections: [{ ... }] }` |
-| `spec_doc_user_update` | `{ type: "spec_doc_user_update", document: "..." }` |
-| `query_preview_shape` | `{ type: "query_preview_shape", status: "accepted" \| "declined", shape?: {...} }` |
+| `pendingInterrupt.type` | `interrupt_content` shape | `display` rendering |
+|---|---|---|
+| `approval_response` | `{ type: "approval_response", label: "Approve & start phase 1" }` | Numbered menu of the available response options |
+| `user_ds_selection` | `{ type: "user_ds_selection", selections: [{ datasource_id: "..." }] }` | Numbered menu of candidate datasource IDs (pre-selected one marked). If empty, call `get-taggable-datasources` first to get a real candidate list |
+| `user_entity_selection` | `{ type: "user_entity_selection", selections: [{ ... }] }` | Markdown table of entity → table mappings |
+| `spec_doc_user_update` | `{ type: "spec_doc_user_update", document: "..." }` | Full specification document, rendered as Markdown with section headers |
+| `query_preview_shape` | `{ type: "query_preview_shape", status: "accepted" \| "declined", shape?: {...} }` | Query name/id summary |
+
+`get-conversation` runs the same interrupt-detection logic independently of `build-app` — useful
+for checking whether a conversation is still paused (e.g. because someone resolved it directly in
+the ToolJet UI instead of through this MCP) before sending another message.
 
 ## Example Usage
 
