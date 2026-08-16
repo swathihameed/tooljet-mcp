@@ -379,6 +379,80 @@ function deriveFinalMessage(events: Array<{ type: string; data: any }>): { conte
   return null;
 }
 
+// Extracts the readable text out of a message/update_message event's sections, mirroring the
+// section-unwrapping logic in deriveFinalMessage (kept separate since this is used for every
+// message event in the stream, not just the final one).
+function extractMessageText(data: any): string | undefined {
+  if (typeof data?.content === "string" && data.content.trim()) return data.content;
+  const sections = data?.metadata?.sections;
+  if (!Array.isArray(sections)) return undefined;
+  const text = sections
+    .filter((s: any) => !s.ephemeral && s.type !== "output-widget-interactive")
+    .map((s: any) => (typeof s.content === "string" ? s.content : null))
+    .filter(Boolean)
+    .join("\n\n");
+  return text || undefined;
+}
+
+function countCreateUpdateDelete(bucket: any): { created: number; updated: number; deleted: number } | null {
+  if (!bucket) return null;
+  const created = bucket.create?.length ?? 0;
+  const updated = bucket.update?.length ?? 0;
+  const deleted = bucket.delete?.length ?? 0;
+  if (!created && !updated && !deleted) return null;
+  return { created, updated, deleted };
+}
+
+// A `diff` event's payload is shaped for the frontend's React state reducer (full component
+// styles/layout/handlers) — nothing an LLM caller needs to read. Reduce it to counts of what
+// changed per resource type instead.
+function summarizeDiff(eventData: any): Record<string, { created: number; updated: number; deleted: number }> {
+  const data = eventData?.data ?? eventData;
+  const summary: Record<string, { created: number; updated: number; deleted: number }> = {};
+
+  for (const key of ["events", "queries", "pages", "folders"]) {
+    const counts = countCreateUpdateDelete(data?.[key]);
+    if (counts) summary[key] = counts;
+  }
+
+  // Components are nested inside each touched page's own `components` field, not top-level.
+  const components = { created: 0, updated: 0, deleted: 0 };
+  const touchedPages = [...(data?.pages?.create ?? []), ...(data?.pages?.update ?? [])];
+  for (const page of touchedPages) {
+    const counts = countCreateUpdateDelete(page?.components);
+    if (counts) {
+      components.created += counts.created;
+      components.updated += counts.updated;
+      components.deleted += counts.deleted;
+    }
+  }
+  if (components.created || components.updated || components.deleted) summary.components = components;
+
+  return summary;
+}
+
+// Reduces one SSE event to what an LLM caller actually needs — the backend's payload is shaped
+// for the frontend's own state reducer, not for reading. `finalMessage`/`pendingInterrupt.display`
+// already carry the important summary; this just makes the accompanying `events` list lightweight
+// instead of repeating the same information as a full React-diff payload.
+function summarizeEvent(event: { type: string; data: any }): { type: string; [key: string]: any } {
+  switch (event.type) {
+    case "message":
+    case "update_message": {
+      const text = extractMessageText(event.data);
+      return text ? { type: event.type, text } : { type: event.type };
+    }
+    case "diff":
+      return { type: "diff", changed: summarizeDiff(event.data) };
+    case "preview":
+      return { type: "preview", preview: event.data?.preview };
+    case "stream_error":
+      return { type: "stream_error", message: event.data?.message };
+    default:
+      return { type: event.type };
+  }
+}
+
 // Create server instance
 const server = new McpServer({
   name: "tooljet-mcp",
@@ -525,7 +599,7 @@ server.tool(
             ],
         };
         }
-    
+
         const apps = appsData;
     
         return {
@@ -561,7 +635,7 @@ server.tool(
             ],
         };
         }
-    
+
         const user = userData;
     
         return {
@@ -755,6 +829,7 @@ server.tool(
       };
     } catch (error) {
       return {
+        isError: true,
         content: [
           {
             type: "text",
@@ -787,6 +862,7 @@ server.tool(
       return { content: [{ type: "text", text: JSON.stringify(conversations) }] };
     } catch (error) {
       return {
+        isError: true,
         content: [
           {
             type: "text",
@@ -816,6 +892,7 @@ server.tool(
       return { content: [{ type: "text", text: JSON.stringify(datasources) }] };
     } catch (error) {
       return {
+        isError: true,
         content: [
           {
             type: "text",
@@ -843,6 +920,7 @@ server.tool(
       return { content: [{ type: "text", text: JSON.stringify(balance) }] };
     } catch (error) {
       return {
+        isError: true,
         content: [
           {
             type: "text",
@@ -869,6 +947,7 @@ server.tool(
       return { content: [{ type: "text", text: JSON.stringify(usage) }] };
     } catch (error) {
       return {
+        isError: true,
         content: [
           {
             type: "text",
@@ -931,8 +1010,14 @@ server.tool(
         .describe(
           "Structured answer to a pending interrupt reported by a previous call's `pendingInterrupt` field. Omit unless resuming one."
         ),
+      include_raw_events: z
+        .boolean()
+        .optional()
+        .describe(
+          "Include the full, unfiltered SSE event stream (component/query/page definitions as sent to the frontend) instead of a lightweight summary. Only needed for debugging — omit for normal use."
+        ),
     },
-    async ({ app_id, prompt, conversation_id, interrupt_content }) => {
+    async ({ app_id, prompt, conversation_id, interrupt_content, include_raw_events }) => {
       try {
         const conversationId =
           conversation_id ?? (await createConversation(app_id, "generate")).id;
@@ -980,13 +1065,14 @@ server.tool(
                 conversationId,
                 finalMessage,
                 pendingInterrupt,
-                events,
+                events: include_raw_events ? events : events.map(summarizeEvent),
               }),
             },
           ],
         };
       } catch (error) {
         return {
+          isError: true,
           content: [
             {
               type: "text",
